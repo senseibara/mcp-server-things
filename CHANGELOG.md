@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-02-25
+
+### Fixed
+- **Upgraded things.py to v1.0.0** to fix SQLite lock contention with Things 3
+  - things.py 0.x held open SQLite connections via the `things3` module, blocking Things 3's WAL commits during cloud sync
+  - things.py 1.0.0 uses read-only connections with proper cleanup via `weakref.finalize()`
+  - Resolves intermittent Things 3 UI freezes caused by `btreeInvokeBusyHandler` blocking on sync commits
+
 ## [1.4.3] - 2026-02-02
 
 ### Fixed
