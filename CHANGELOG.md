@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-06-05
+
+### Fixed
+- **Removed blocking AppleScript probe from server startup** - fixes intermittent "failed to connect" errors
+  - `ServerManager.start()` ran a synchronous `osascript "tell application Things3"` probe before the MCP stdio loop started
+  - The probe gated nothing (it only logged) but blocked the MCP handshake for up to 5s, auto-launched Things 3, and could trigger a macOS Automation (TCC) consent dialog that stalled long enough for clients to mark the server as failed
+  - Things 3 availability is already checked lazily on the first tool call via `AppleScriptManager` (async, with retries); explicit checks remain via `--health-check` / `--test-applescript`
+- **Fixed stale hardcoded version in `--version` output** - now reports the actual package version instead of "1.0.0"
+
 ## [1.4.4] - 2026-02-25
 
 ### Fixed

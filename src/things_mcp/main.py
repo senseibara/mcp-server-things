@@ -260,8 +260,9 @@ async def test_applescript_connectivity(timeout: int, retry_count: int) -> int:
 
 def show_version():
     """Show version information."""
+    from . import __version__
     print("Things 3 MCP Server")
-    print("Version: 1.0.0")
+    print(f"Version: {__version__}")
     print("FastMCP-based Model Context Protocol server for Things 3 integration")
     print("")
     print("Requirements:")
