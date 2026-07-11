@@ -91,6 +91,10 @@ class ThingsTools:
         """Get all areas directly from database."""
         return await self.read_ops.get_areas(include_items=include_items)
 
+    async def get_headings(self, project_uuid: str, include_items: bool = False) -> List[Dict]:
+        """Get all headings (sections) within a project directly from database."""
+        return await self.read_ops.get_headings(project_uuid=project_uuid, include_items=include_items)
+
     async def get_tags(self, include_items: bool = False) -> List[Dict]:
         """Get all tags with counts or items - super fast with things.py."""
         return await self.read_ops.get_tags(include_items=include_items)
@@ -201,6 +205,18 @@ class ThingsTools:
     async def delete_area(self, area_id: str) -> Dict[str, Any]:
         """Delete an area using AppleScript (write operation)."""
         return await self.write_ops.delete_area(area_id=area_id)
+
+    async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
+        """Add a new heading (section) within a project using AppleScript (write operation)."""
+        return await self.write_ops.add_heading(title=title, **kwargs)
+
+    async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
+        """Update a heading (section) using AppleScript (write operation)."""
+        return await self.write_ops.update_heading(heading_id=heading_id, **kwargs)
+
+    async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
+        """Delete a heading (section) using AppleScript (write operation)."""
+        return await self.write_ops.delete_heading(heading_id=heading_id)
 
     async def move_record(self, todo_id: str, destination_list: str) -> Dict[str, Any]:
         """Move a todo using AppleScript (write operation)."""

@@ -186,6 +186,22 @@ class ToolsHelpers:
         }
 
     @staticmethod
+    def convert_heading(heading: Dict) -> Dict:
+        """Convert things.py heading (task type='heading') format to MCP API format.
+
+        Args:
+            heading: Heading dict from things.py
+
+        Returns:
+            Converted heading dict in MCP format
+        """
+        return {
+            'uuid': heading.get('uuid'),
+            'title': heading.get('title'),
+            'project': heading.get('project')
+        }
+
+    @staticmethod
     def parse_period_to_days(period: str) -> int:
         """Parse period string (e.g., '7d', '2w') to number of days.
 

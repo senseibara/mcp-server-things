@@ -326,12 +326,13 @@ class ThingsMCPServer:
             tags: Optional[str] = Field(None, description="Comma-separated tags (only existing tags applied)"),
             when: Optional[str] = Field(None, description="Schedule date/time (e.g., 'today', '2024-12-25@14:30')"),
             deadline: Optional[str] = Field(None, description="Deadline for the todo (YYYY-MM-DD)"),
-            list_id: Optional[str] = Field(None, description="ID of project/area to add to"),
+            list_id: Optional[str] = Field(None, description="ID of project/area to add to. Required if 'heading' (by title) is used."),
             list_title: Optional[str] = Field(None, description="Title of project/area to add to"),
-            heading: Optional[str] = Field(None, description="Heading to add under"),
+            heading: Optional[str] = Field(None, description="Title of an existing heading (section) within the project (list_id) to add this todo under"),
+            heading_id: Optional[str] = Field(None, description="ID of an existing heading to add this todo under (alternative to 'heading' by title; does not require list_id)"),
             checklist_items: Optional[List[str]] = Field(None, description="List of checklist items to add")
         ) -> Dict[str, Any]:
-            """Create a new todo. Supports scheduling (when='today', 'tomorrow', 'YYYY-MM-DD'), tags, projects, deadlines, and notes."""
+            """Create a new todo. Supports scheduling (when='today', 'tomorrow', 'YYYY-MM-DD'), tags, projects, deadlines, notes, and assigning to a heading (section) via 'heading'+'list_id' or 'heading_id'."""
             try:
                 # Validate date parameters
                 if when:
@@ -367,11 +368,12 @@ class ThingsMCPServer:
                     list_id=list_id,
                     list_title=list_title,
                     heading=heading,
+                    heading_id=heading_id,
                     checklist_items=checklist_items
                 )
-                
+
                 # Enhance response with tag validation feedback if available
-                if (tag_list and self.tools.tag_validation_service and 
+                if (tag_list and self.tools.tag_validation_service and
                     hasattr(result, 'get') and result.get('success')):
                     # Get tag validation info from the result
                     if 'tag_info' in result:
@@ -382,7 +384,7 @@ class ThingsMCPServer:
                             result['message'] = result.get('message', '') + f" Filtered tags: {', '.join(tag_info['filtered_tags'])}"
                         if tag_info.get('warnings'):
                             result['tag_warnings'] = tag_info['warnings']
-                
+
                 return result
             except Exception as e:
                 logger.error(f"Error adding todo: {e}")
@@ -397,9 +399,12 @@ class ThingsMCPServer:
             when: Optional[str] = Field(None, description="Schedule date/time (e.g., 'today', '2024-12-25@14:30')"),
             deadline: Optional[str] = Field(None, description="New deadline"),
             completed: Optional[str] = Field(None, description="Mark as completed (true/false)"),
-            canceled: Optional[str] = Field(None, description="Mark as canceled (true/false)")
+            canceled: Optional[str] = Field(None, description="Mark as canceled (true/false)"),
+            list_id: Optional[str] = Field(None, description="ID of the project containing 'heading'. Required if 'heading' (by title) is used."),
+            heading: Optional[str] = Field(None, description="Title of an existing heading (section) to move this todo into. Requires list_id."),
+            heading_id: Optional[str] = Field(None, description="ID of an existing heading to move this todo into (alternative to 'heading' by title; does not require list_id)")
         ) -> Dict[str, Any]:
-            """Update an existing todo. Supports partial updates to any field including status, scheduling, tags, and content."""
+            """Update an existing todo. Supports partial updates to any field including status, scheduling, tags, content, and moving to a heading (section) via 'heading'+'list_id' or 'heading_id'."""
             try:
                 # Validate date parameters
                 if when:
@@ -444,11 +449,14 @@ class ThingsMCPServer:
                     when=when,
                     deadline=deadline,
                     completed=completed_bool,
-                    canceled=canceled_bool
+                    canceled=canceled_bool,
+                    list_id=list_id,
+                    heading=heading,
+                    heading_id=heading_id
                 )
-                
+
                 # Enhance response with tag validation feedback if available
-                if (tag_list and self.tools.tag_validation_service and 
+                if (tag_list and self.tools.tag_validation_service and
                     hasattr(result, 'get') and result.get('success')):
                     # Get tag validation info from the result
                     if 'tag_info' in result:
@@ -459,7 +467,7 @@ class ThingsMCPServer:
                             result['message'] = result.get('message', '') + f" Filtered tags: {', '.join(tag_info['filtered_tags'])}"
                         if tag_info.get('warnings'):
                             result['tag_warnings'] = tag_info['warnings']
-                
+
                 return result
             except Exception as e:
                 logger.error(f"Error updating todo: {e}")
@@ -632,7 +640,7 @@ class ThingsMCPServer:
         @self.mcp.tool()
         async def move_record(
             todo_id: str = Field(..., description="ID of the todo to move"),
-            destination_list: str = Field(..., description="Destination: list name (inbox, today, anytime, someday, upcoming, logbook), project:ID, or area:ID")
+            destination_list: str = Field(..., description="Destination: list name (inbox, today, anytime, someday, upcoming, logbook), project:ID, area:ID, or heading:ID")
         ) -> Dict[str, Any]:
             """Move a todo to a different list, project, or area."""
             try:
@@ -644,7 +652,7 @@ class ThingsMCPServer:
         @self.mcp.tool()
         async def bulk_move_records(
             todo_ids: str = Field(..., description="Comma-separated list of todo IDs to move"),
-            destination: str = Field(..., description="Destination: list name (inbox, today, anytime, someday, upcoming, logbook), project:ID, or area:ID"),
+            destination: str = Field(..., description="Destination: list name (inbox, today, anytime, someday, upcoming, logbook), project:ID, area:ID, or heading:ID"),
             max_concurrent: int = Field(5, description="Maximum concurrent operations (1-10)", ge=1, le=10)
         ) -> Dict[str, Any]:
             """Move multiple todos to the same destination efficiently. The move operation handles scheduling automatically based on the destination."""
@@ -920,6 +928,60 @@ class ThingsMCPServer:
                 return await self.tools.delete_area(id)
             except Exception as e:
                 logger.error(f"Error deleting area: {e}")
+                raise
+
+        # Heading (section) management tools
+        @self.mcp.tool()
+        async def get_headings(
+            project_id: str = Field(..., description="ID of the project to list headings (sections) for"),
+            include_items: bool = Field(False, description="Include todos within each heading")
+        ) -> List[Dict[str, Any]]:
+            """Get all headings (sections) within a project."""
+            try:
+                return await self.tools.get_headings(project_uuid=project_id, include_items=include_items)
+            except Exception as e:
+                logger.error(f"Error getting headings: {e}")
+                raise
+
+        @self.mcp.tool()
+        async def add_heading(
+            title: str = Field(..., min_length=1, description="Title of the heading (section)"),
+            list_id: str = Field(..., description="ID of the project to create this heading in")
+        ) -> Dict[str, Any]:
+            """Create a new heading (section) within a project."""
+            try:
+                return await self.tools.add_heading(
+                    title=title,
+                    list_id=list_id
+                )
+            except Exception as e:
+                logger.error(f"Error adding heading: {e}")
+                raise
+
+        @self.mcp.tool()
+        async def update_heading(
+            id: str = Field(..., description="ID of the heading to update"),
+            title: str = Field(..., min_length=1, description="New title for the heading")
+        ) -> Dict[str, Any]:
+            """Update an existing heading's (section's) title."""
+            try:
+                return await self.tools.update_heading(
+                    heading_id=id,
+                    title=title
+                )
+            except Exception as e:
+                logger.error(f"Error updating heading: {e}")
+                raise
+
+        @self.mcp.tool()
+        async def delete_heading(
+            id: str = Field(..., description="ID of the heading to delete")
+        ) -> Dict[str, Any]:
+            """Delete a heading (section) by ID."""
+            try:
+                return await self.tools.delete_heading(id)
+            except Exception as e:
+                logger.error(f"Error deleting heading: {e}")
                 raise
 
         # List-based tools

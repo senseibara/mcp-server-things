@@ -164,6 +164,35 @@ class ReadOperations:
             logger.error(f"Error in _get_areas_sync: {e}")
             return []
 
+    async def get_headings(self, project_uuid: str, include_items: bool = False) -> List[Dict]:
+        """Get all headings (sections) within a project using things.py."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._get_headings_sync, project_uuid, include_items)
+
+    def _get_headings_sync(self, project_uuid: str, include_items: bool = False) -> List[Dict]:
+        """Synchronous implementation using things.py."""
+        try:
+            headings = things.tasks(type='heading', project=project_uuid)
+            result = []
+
+            for heading in headings:
+                converted = ToolsHelpers.convert_heading(heading)
+
+                if include_items and heading.get('uuid'):
+                    try:
+                        heading_todos = things.todos(heading=heading['uuid'])
+                        converted['todos'] = [ToolsHelpers.convert_todo(t) for t in heading_todos]
+                    except Exception as e:
+                        logger.error(f"Error getting heading todos: {e}")
+
+                result.append(converted)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in _get_headings_sync: {e}")
+            return []
+
     async def get_tags(self, include_items: bool = False) -> List[Dict]:
         """Get all tags using things.py."""
         loop = asyncio.get_event_loop()

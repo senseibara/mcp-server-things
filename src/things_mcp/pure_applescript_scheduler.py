@@ -110,6 +110,18 @@ class PureAppleScriptScheduler:
         """Delete an area using AppleScript."""
         return await self.todo_ops.delete_area(area_id)
 
+    async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
+        """Add a new heading (section) within a project using AppleScript."""
+        return await self.todo_ops.add_heading(title, **kwargs)
+
+    async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
+        """Update an existing heading (section) using AppleScript."""
+        return await self.todo_ops.update_heading(heading_id, **kwargs)
+
+    async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
+        """Delete a heading (section) using AppleScript."""
+        return await self.todo_ops.delete_heading(heading_id)
+
     # ========== SEARCH OPERATIONS (delegate to SearchOperations) ==========
 
     async def search_advanced(self, **filters) -> List[Dict[str, Any]]:

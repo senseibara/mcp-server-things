@@ -257,6 +257,52 @@ class WriteOperations:
                 "message": "Failed to delete area"
             }
 
+    async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
+        """Add a new heading (section) within a project using AppleScript."""
+        try:
+            return await self.reliable_scheduler.add_heading(title=title, **kwargs)
+        except Exception as e:
+            logger.error(f"Error adding heading: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to add heading"
+            }
+
+    async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
+        """Update a heading (section) using AppleScript."""
+        try:
+            heading_id = ParameterValidator.validate_non_empty_string(heading_id, 'heading_id')
+        except ValidationError as e:
+            logger.error(f"Validation error in update_heading: {e}")
+            return create_validation_error_response(e)
+
+        try:
+            return await self.reliable_scheduler.update_heading(heading_id=heading_id, **kwargs)
+        except Exception as e:
+            logger.error(f"Error updating heading: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to update heading"
+            }
+
+    async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
+        """Delete a heading (section) using AppleScript."""
+        try:
+            heading_id = ParameterValidator.validate_non_empty_string(heading_id, 'heading_id')
+            return await self.reliable_scheduler.delete_heading(heading_id)
+        except ValidationError as e:
+            logger.error(f"Validation error in delete_heading: {e}")
+            return create_validation_error_response(e)
+        except Exception as e:
+            logger.error(f"Error deleting heading: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to delete heading"
+            }
+
     async def move_record(self, todo_id: str, destination_list: str) -> Dict[str, Any]:
         """Move a todo using AppleScript."""
         try:

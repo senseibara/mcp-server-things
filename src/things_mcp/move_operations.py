@@ -42,9 +42,9 @@ class MoveOperationsTools:
 
         Args:
             todo_id: ID of the todo to move
-            destination: Destination list/project/area
+            destination: Destination list/project/area/heading
                         Valid values: inbox, today, upcoming, anytime, someday,
-                        project:[project-id], area:[area-id]
+                        project:[project-id], area:[area-id], heading:[heading-id]
 
         Returns:
             Dict with move operation result
@@ -208,24 +208,26 @@ class MoveOperationsTools:
         self,
         todo_id: str,
         project_id: str,
-        heading: Optional[str] = None
+        heading_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Move a todo to a specific project, optionally under a heading.
-        
+
         Args:
             todo_id: ID of the todo to move
             project_id: ID of the target project
-            heading: Optional heading within the project
-            
+            heading_id: Optional ID of a heading within the project. A heading
+                already belongs to a specific project, so when provided this
+                moves the todo directly into that heading (project_id is
+                ignored in that case).
+
         Returns:
             Dict with move result
         """
-        destination = f"project:{project_id}"
-        if heading:
-            destination += f":{heading}"
-        
-        return await self.move_record(todo_id, destination)
+        if heading_id:
+            return await self.move_record(todo_id, f"heading:{heading_id}")
+
+        return await self.move_record(todo_id, f"project:{project_id}")
     
     async def move_to_area(
         self,
@@ -284,10 +286,18 @@ class MoveOperationsTools:
                 return {"valid": True, "message": "Valid area destination"}
             else:
                 return {"valid": False, "message": "Area ID cannot be empty"}
-        
+
+        # Check for heading destinations
+        if destination.startswith("heading:"):
+            heading_part = destination[8:]  # Remove "heading:" prefix
+            if heading_part:
+                return {"valid": True, "message": "Valid heading destination"}
+            else:
+                return {"valid": False, "message": "Heading ID cannot be empty"}
+
         return {
             "valid": False,
-            "message": f"Invalid destination '{destination}'. Must be a list name, project:ID, or area:ID"
+            "message": f"Invalid destination '{destination}'. Must be a list name, project:ID, area:ID, or heading:ID"
         }
     
     async def _get_todo_info(self, todo_id: str) -> Dict[str, Any]:
@@ -388,6 +398,10 @@ class MoveOperationsTools:
                 # Moving to an area
                 area_id = destination[5:]  # Remove "area:" prefix
                 script = await self._build_area_move_script(todo_id, area_id)
+            elif destination.startswith("heading:"):
+                # Moving to a heading (section) within a project
+                heading_id = destination[8:]  # Remove "heading:" prefix
+                script = await self._build_heading_move_script(todo_id, heading_id)
             else:
                 return {
                     "success": False,
@@ -492,16 +506,43 @@ class MoveOperationsTools:
             try
                 set theTodo to to do id "{todo_id}"
                 set targetArea to area id "{area_id}"
-                
+
                 -- Set the area property instead of using move command
                 -- The move command doesn't work for areas in Things 3
                 set area of theTodo to targetArea
-                
+
                 return "MOVED to area {area_id}"
             on error errMsg
                 return "ERROR: " & errMsg
             end try
         end tell
         '''
-        
+
+        return script
+
+    async def _build_heading_move_script(
+        self,
+        todo_id: str,
+        heading_id: str
+    ) -> str:
+        """Build AppleScript for moving to a heading (section) within a project.
+
+        A heading already belongs to a specific project, so setting a todo's
+        heading also places it in that project.
+        """
+        script = f'''
+        tell application "Things3"
+            try
+                set theTodo to to do id "{todo_id}"
+                set targetHeading to heading id "{heading_id}"
+
+                set heading of theTodo to targetHeading
+
+                return "MOVED to heading {heading_id}"
+            on error errMsg
+                return "ERROR: " & errMsg
+            end try
+        end tell
+        '''
+
         return script
