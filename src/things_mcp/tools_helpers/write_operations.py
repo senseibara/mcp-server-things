@@ -197,6 +197,66 @@ class WriteOperations:
                 "message": "Failed to update project"
             }
 
+    async def add_area(self, title: str, **kwargs) -> Dict[str, Any]:
+        """Add a new area using AppleScript."""
+        try:
+            result = await self.reliable_scheduler.add_area(title=title, **kwargs)
+
+            tags = kwargs.get('tags', [])
+            if tags and self.tag_validation_service:
+                tag_validation = await self._validate_tags_with_policy(tags)
+                result['tag_info'] = tag_validation
+
+            return result
+        except Exception as e:
+            logger.error(f"Error adding area: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to add area"
+            }
+
+    async def update_area(self, area_id: str, **kwargs) -> Dict[str, Any]:
+        """Update an area using AppleScript."""
+        try:
+            area_id = ParameterValidator.validate_non_empty_string(area_id, 'area_id')
+        except ValidationError as e:
+            logger.error(f"Validation error in update_area: {e}")
+            return create_validation_error_response(e)
+
+        try:
+            result = await self.reliable_scheduler.update_area(area_id=area_id, **kwargs)
+
+            tags = kwargs.get('tags', [])
+            if tags and self.tag_validation_service:
+                tag_validation = await self._validate_tags_with_policy(tags)
+                result['tag_info'] = tag_validation
+
+            return result
+        except Exception as e:
+            logger.error(f"Error updating area: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to update area"
+            }
+
+    async def delete_area(self, area_id: str) -> Dict[str, Any]:
+        """Delete an area using AppleScript."""
+        try:
+            area_id = ParameterValidator.validate_non_empty_string(area_id, 'area_id')
+            return await self.reliable_scheduler.delete_area(area_id)
+        except ValidationError as e:
+            logger.error(f"Validation error in delete_area: {e}")
+            return create_validation_error_response(e)
+        except Exception as e:
+            logger.error(f"Error deleting area: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to delete area"
+            }
+
     async def move_record(self, todo_id: str, destination_list: str) -> Dict[str, Any]:
         """Move a todo using AppleScript."""
         try:

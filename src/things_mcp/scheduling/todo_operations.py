@@ -901,3 +901,171 @@ class TodoOperations:
                 "error": str(e),
                 "message": "Failed to update project"
             }
+
+    def _build_create_area_script(self, title: str, tags: List[str]) -> str:
+        """Build AppleScript for creating a new area.
+
+        Args:
+            title: Area name
+            tags: Tags list
+
+        Returns:
+            AppleScript code
+        """
+        escaped_title = AppleScriptTemplates.escape_string(title)
+
+        script = f'''
+            tell application "Things3"
+                try
+                    set newArea to make new area with properties {{name:{escaped_title}}}
+            '''
+
+        if tags:
+            tags_string = ', '.join(tags)
+            escaped_tags_string = AppleScriptTemplates.escape_string(tags_string)
+            script += f'set tag names of newArea to {escaped_tags_string}\n                    '
+
+        script += '''
+                    return id of newArea
+                on error errMsg
+                    return "error: " & errMsg
+                end try
+            end tell
+            '''
+
+        return script
+
+    async def add_area(self, title: str, **kwargs) -> Dict[str, Any]:
+        """Add a new area using AppleScript."""
+        try:
+            tags = kwargs.get('tags', [])
+
+            # Build and execute script
+            script = self._build_create_area_script(title, tags)
+            result = await self.applescript.execute_applescript(script)
+
+            if result.get("success"):
+                area_id = result.get("output", "").strip()
+                if area_id and not area_id.startswith("error:"):
+                    return {
+                        "success": True,
+                        "area_id": area_id,
+                        "message": "Area created successfully"
+                    }
+                return {
+                    "success": False,
+                    "error": area_id,
+                    "message": "Failed to create area"
+                }
+            return {
+                "success": False,
+                "error": result.get("output", "AppleScript execution failed"),
+                "message": "Failed to create area"
+            }
+
+        except Exception as e:
+            logger.error(f"Error adding area: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to add area"
+            }
+
+    async def update_area(self, area_id: str, **kwargs) -> Dict[str, Any]:
+        """Update an existing area using AppleScript."""
+        try:
+            title = kwargs.get('title', '')
+            tags = kwargs.get('tags', [])
+
+            script = f'''
+            tell application "Things3"
+                try
+                    set targetArea to area id "{area_id}"
+            '''
+
+            if title:
+                escaped_title = AppleScriptTemplates.escape_string(title)
+                script += f'set name of targetArea to {escaped_title}\n                    '
+
+            if tags:
+                tags_string = ', '.join(tags)
+                escaped_tags_string = AppleScriptTemplates.escape_string(tags_string)
+                script += f'set tag names of targetArea to {escaped_tags_string}\n                    '
+
+            script += '''
+                    return "updated"
+                on error errMsg
+                    return "error: " & errMsg
+                end try
+            end tell
+            '''
+
+            result = await self.applescript.execute_applescript(script)
+
+            if result.get("success"):
+                output = result.get("output", "").strip()
+                if output == "updated":
+                    return {
+                        "success": True,
+                        "message": "Area updated successfully"
+                    }
+                return {
+                    "success": False,
+                    "error": output,
+                    "message": "Failed to update area"
+                }
+            return {
+                "success": False,
+                "error": result.get("output", "AppleScript execution failed"),
+                "message": "Failed to update area"
+            }
+
+        except Exception as e:
+            logger.error(f"Error updating area: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to update area"
+            }
+
+    async def delete_area(self, area_id: str) -> Dict[str, Any]:
+        """Delete an area using AppleScript."""
+        try:
+            script = f'''
+            tell application "Things3"
+                try
+                    set targetArea to area id "{area_id}"
+                    delete targetArea
+                    return "deleted"
+                on error errMsg
+                    return "error: " & errMsg
+                end try
+            end tell
+            '''
+            result = await self.applescript.execute_applescript(script)
+
+            if result.get("success"):
+                output = result.get("output", "").strip()
+                if output == "deleted":
+                    return {
+                        "success": True,
+                        "message": "Area deleted successfully"
+                    }
+                return {
+                    "success": False,
+                    "error": output,
+                    "message": "Failed to delete area"
+                }
+            return {
+                "success": False,
+                "error": result.get("output", "AppleScript execution failed"),
+                "message": "Failed to delete area"
+            }
+
+        except Exception as e:
+            logger.error(f"Error deleting area: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Failed to delete area"
+            }

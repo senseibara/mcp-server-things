@@ -874,7 +874,54 @@ class ThingsMCPServer:
             except Exception as e:
                 logger.error(f"Error getting areas: {e}")
                 raise
-        
+
+        @self.mcp.tool()
+        async def add_area(
+            title: str = Field(..., min_length=1, description="Title of the area"),
+            tags: Optional[str] = Field(None, description="Comma-separated tags to apply to the area")
+        ) -> Dict[str, Any]:
+            """Create a new area. Supports tags."""
+            try:
+                # Convert comma-separated tags to list
+                tag_list = [t.strip() for t in tags.split(",")] if tags else None
+                return await self.tools.add_area(
+                    title=title,
+                    tags=tag_list
+                )
+            except Exception as e:
+                logger.error(f"Error adding area: {e}")
+                raise
+
+        @self.mcp.tool()
+        async def update_area(
+            id: str = Field(..., description="ID of the area to update"),
+            title: Optional[str] = Field(None, description="New title"),
+            tags: Optional[str] = Field(None, description="Comma-separated new tags")
+        ) -> Dict[str, Any]:
+            """Update an existing area. Supports partial updates to title and tags."""
+            try:
+                # Convert comma-separated tags to list
+                tag_list = [t.strip() for t in tags.split(",")] if tags else None
+                return await self.tools.update_area(
+                    area_id=id,
+                    title=title,
+                    tags=tag_list
+                )
+            except Exception as e:
+                logger.error(f"Error updating area: {e}")
+                raise
+
+        @self.mcp.tool()
+        async def delete_area(
+            id: str = Field(..., description="ID of the area to delete")
+        ) -> Dict[str, Any]:
+            """Delete an area by ID."""
+            try:
+                return await self.tools.delete_area(id)
+            except Exception as e:
+                logger.error(f"Error deleting area: {e}")
+                raise
+
         # List-based tools
         @self.mcp.tool()
         async def get_inbox(
