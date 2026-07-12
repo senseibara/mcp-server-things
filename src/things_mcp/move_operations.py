@@ -12,6 +12,7 @@ import logging
 
 from .services.applescript_manager import AppleScriptManager
 from .services.validation_service import ValidationService
+from .scheduling.heading_operations import HeadingOperations
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,9 @@ class MoveOperationsTools:
     ):
         self.applescript = applescript_manager
         self.validator = validation_service
+        # Heading moves must use the URL scheme; Things 3's AppleScript
+        # dictionary has no heading class.
+        self.heading_ops = HeadingOperations(applescript_manager)
     
     async def move_record(
         self,
@@ -399,9 +403,20 @@ class MoveOperationsTools:
                 area_id = destination[5:]  # Remove "area:" prefix
                 script = await self._build_area_move_script(todo_id, area_id)
             elif destination.startswith("heading:"):
-                # Moving to a heading (section) within a project
+                # Moving to a heading (section) within a project.
+                # AppleScript cannot do this (no heading class in Things 3's
+                # dictionary) - delegate to the URL scheme with verification.
                 heading_id = destination[8:]  # Remove "heading:" prefix
-                script = await self._build_heading_move_script(todo_id, heading_id)
+                heading_result = await self.heading_ops.assign_todo_to_heading(
+                    todo_id, heading_id=heading_id
+                )
+                if heading_result.get("success"):
+                    return {"success": True}
+                return {
+                    "success": False,
+                    "error": heading_result.get("error", "HEADING_MOVE_FAILED"),
+                    "message": heading_result.get("message", "Failed to move todo to heading")
+                }
             else:
                 return {
                     "success": False,
@@ -520,29 +535,3 @@ class MoveOperationsTools:
 
         return script
 
-    async def _build_heading_move_script(
-        self,
-        todo_id: str,
-        heading_id: str
-    ) -> str:
-        """Build AppleScript for moving to a heading (section) within a project.
-
-        A heading already belongs to a specific project, so setting a todo's
-        heading also places it in that project.
-        """
-        script = f'''
-        tell application "Things3"
-            try
-                set theTodo to to do id "{todo_id}"
-                set targetHeading to heading id "{heading_id}"
-
-                set heading of theTodo to targetHeading
-
-                return "MOVED to heading {heading_id}"
-            on error errMsg
-                return "ERROR: " & errMsg
-            end try
-        end tell
-        '''
-
-        return script

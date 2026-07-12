@@ -258,7 +258,7 @@ class WriteOperations:
             }
 
     async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
-        """Add a new heading (section) within a project using AppleScript."""
+        """Add a new heading (section) within a project via the Things URL scheme."""
         try:
             return await self.reliable_scheduler.add_heading(title=title, **kwargs)
         except Exception as e:
@@ -270,7 +270,7 @@ class WriteOperations:
             }
 
     async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
-        """Update a heading (section) using AppleScript."""
+        """Rename a heading (section) via the Things URL scheme."""
         try:
             heading_id = ParameterValidator.validate_non_empty_string(heading_id, 'heading_id')
         except ValidationError as e:
@@ -288,7 +288,7 @@ class WriteOperations:
             }
 
     async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
-        """Delete a heading (section) using AppleScript."""
+        """Delete a heading (section) - not supported by Things public APIs."""
         try:
             heading_id = ParameterValidator.validate_non_empty_string(heading_id, 'heading_id')
             return await self.reliable_scheduler.delete_heading(heading_id)

@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
 
 from ..locale_aware_dates import locale_handler
 from ..utils.applescript_utils import AppleScriptTemplates
+from .heading_operations import HeadingOperations
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ class TodoOperations:
         """
         self.applescript = applescript_manager
         self.scheduler = scheduler
+        # Heading (section) writes must go through the URL scheme;
+        # Things 3's AppleScript dictionary has no heading class.
+        self.heading_ops = HeadingOperations(applescript_manager)
 
     def _convert_to_boolean(self, value: Any) -> Optional[bool]:
         """
@@ -63,9 +67,14 @@ class TodoOperations:
 
     def _build_create_todo_script(self, title: str, notes: str, tags: List[str],
                                   deadline: str, area: str, project: str,
-                                  checklist: List[str], heading: str = '',
-                                  heading_id: str = '') -> str:
+                                  checklist: List[str]) -> str:
         """Build AppleScript for creating a new todo.
+
+        NOTE: Heading (section) assignment is intentionally NOT handled here.
+        Things 3's AppleScript dictionary has no `heading` class, so any
+        script referencing headings fails to compile ("The variable heading
+        is not defined"). Heading assignment happens after creation via the
+        URL scheme (see HeadingOperations.assign_todo_to_heading).
 
         Args:
             title: Todo title
@@ -75,10 +84,6 @@ class TodoOperations:
             area: Area name or ID
             project: Project ID
             checklist: Checklist items
-            heading: Title of an existing heading (section) within `project`
-                to assign this todo to (requires `project` to also be set)
-            heading_id: ID of an existing heading to assign this todo to
-                (takes precedence over `heading`; does not require `project`)
 
         Returns:
             AppleScript code
@@ -101,16 +106,6 @@ class TodoOperations:
 
         if project:
             script += f'set project of newTodo to project id "{project}"\n                    '
-
-        # Assign to a specific heading (section) within a project.
-        # heading_id (direct reference) takes precedence over heading (by title,
-        # which requires the enclosing project to also be known).
-        if heading_id:
-            escaped_heading_id = AppleScriptTemplates.escape_string(heading_id)
-            script += f'set heading of newTodo to heading id {escaped_heading_id}\n                    '
-        elif heading and project:
-            escaped_heading = AppleScriptTemplates.escape_string(heading)
-            script += f'set heading of newTodo to heading {escaped_heading} of project id "{project}"\n                    '
 
         if tags:
             tags_string = ', '.join(tags)
@@ -189,8 +184,7 @@ class TodoOperations:
 
             # Otherwise use AppleScript (faster, more reliable for non-checklist todos)
             script = self._build_create_todo_script(title, notes, tags, deadline,
-                                                    area, project, checklist,
-                                                    heading, heading_id)
+                                                    area, project, checklist)
             result = await self.applescript.execute_applescript(script)
 
             if result.get("success"):
@@ -201,6 +195,23 @@ class TodoOperations:
                         "success": True,
                         "todo_id": todo_id
                     }
+
+                    # Assign to a heading (section) if requested. This must go
+                    # through the URL scheme; AppleScript has no heading class.
+                    if heading_id or heading:
+                        heading_result = await self.heading_ops.assign_todo_to_heading(
+                            todo_id,
+                            heading_id=heading_id,
+                            heading=heading,
+                            project_id=project,
+                        )
+                        if not heading_result.get("success"):
+                            response["warning"] = (
+                                "Todo was created but could not be assigned to "
+                                f"the heading: {heading_result.get('message', heading_result.get('error'))}"
+                            )
+                        else:
+                            response["heading_assignment"] = heading_result.get("message")
 
                     # Schedule if when date provided
                     if when:
@@ -273,7 +284,8 @@ class TodoOperations:
                 params['deadline'] = kwargs['deadline']
 
             if kwargs.get('list_id'):
-                params['list'] = kwargs['list_id']
+                # IDs must be passed as 'list-id'; 'list' expects a title.
+                params['list-id'] = kwargs['list_id']
             elif kwargs.get('list_title'):
                 params['list'] = kwargs['list_title']
 
@@ -525,10 +537,11 @@ class TodoOperations:
 
     def _build_update_script(self, todo_id: str, title: str, notes: str, tags: List[str],
                             deadline: str, area: str, project: str,
-                            completed: Optional[bool], canceled: Optional[bool],
-                            heading: str = '', heading_id: str = '',
-                            heading_project_id: str = '') -> str:
+                            completed: Optional[bool], canceled: Optional[bool]) -> str:
         """Build AppleScript for updating a todo.
+
+        Heading (section) changes are handled separately via the URL scheme
+        (Things 3's AppleScript dictionary has no heading class).
 
         Args:
             todo_id: Todo ID to update
@@ -540,13 +553,6 @@ class TodoOperations:
             project: New project
             completed: Completion status
             canceled: Canceled status
-            heading: Title of an existing heading (section) to move this todo
-                into (requires `heading_project_id` to also be set)
-            heading_id: ID of an existing heading to move this todo into
-                (takes precedence over `heading`; does not require
-                `heading_project_id`)
-            heading_project_id: ID of the project that contains `heading`,
-                required when specifying `heading` by title
 
         Returns:
             AppleScript code
@@ -577,16 +583,10 @@ class TodoOperations:
             escaped_project = AppleScriptTemplates.escape_string(project)
             script += f'set project of targetTodo to project {escaped_project}\n                    '
 
-        # Move to a specific heading (section) within a project.
-        # heading_id (direct reference) takes precedence over heading (by
-        # title, which requires the enclosing project to also be known).
-        if heading_id:
-            escaped_heading_id = AppleScriptTemplates.escape_string(heading_id)
-            script += f'set heading of targetTodo to heading id {escaped_heading_id}\n                    '
-        elif heading and heading_project_id:
-            escaped_heading = AppleScriptTemplates.escape_string(heading)
-            escaped_heading_project_id = AppleScriptTemplates.escape_string(heading_project_id)
-            script += f'set heading of targetTodo to heading {escaped_heading} of project id {escaped_heading_project_id}\n                    '
+        # NOTE: heading (section) assignment is intentionally NOT handled in
+        # AppleScript — Things 3 has no heading class in its scripting
+        # dictionary. It is applied afterwards via the URL scheme in
+        # update_todo().
 
         # Update tags if provided
         if tags:
@@ -670,25 +670,41 @@ class TodoOperations:
 
             # Build and execute script
             script = self._build_update_script(todo_id, title, notes, tags, deadline,
-                                              area, project, completed, canceled,
-                                              heading, heading_id, heading_project_id)
+                                              area, project, completed, canceled)
             result = await self.applescript.execute_applescript(script)
 
             if result.get("success"):
                 output = result.get("output", "").strip()
                 if output == "updated":
-                    # Schedule if when date provided
-                    if when:
-                        schedule_result = await self.scheduler.schedule_todo_reliable(todo_id, when)
-                        return {
-                            "success": True,
-                            "message": "Todo updated and scheduled successfully",
-                            "scheduling": schedule_result
-                        }
-                    return {
+                    response = {
                         "success": True,
                         "message": "Todo updated successfully"
                     }
+
+                    # Move to a heading (section) if requested. This must go
+                    # through the URL scheme; AppleScript has no heading class.
+                    if heading_id or heading:
+                        heading_result = await self.heading_ops.assign_todo_to_heading(
+                            todo_id,
+                            heading_id=heading_id,
+                            heading=heading,
+                            project_id=heading_project_id or project,
+                        )
+                        if not heading_result.get("success"):
+                            response["warning"] = (
+                                "Todo fields were updated but the heading "
+                                f"assignment failed: {heading_result.get('message', heading_result.get('error'))}"
+                            )
+                        else:
+                            response["heading_assignment"] = heading_result.get("message")
+
+                    # Schedule if when date provided
+                    if when:
+                        schedule_result = await self.scheduler.schedule_todo_reliable(todo_id, when)
+                        response["message"] = "Todo updated and scheduled successfully"
+                        response["scheduling"] = schedule_result
+
+                    return response
                 return {
                     "success": False,
                     "error": output,
@@ -1129,171 +1145,49 @@ class TodoOperations:
                 "message": "Failed to delete area"
             }
 
-    def _build_create_heading_script(self, title: str, project_id: str) -> str:
-        """Build AppleScript for creating a new heading (section) within a project.
-
-        Args:
-            title: Heading name
-            project_id: ID of the project to create the heading in
-
-        Returns:
-            AppleScript code
-        """
-        escaped_title = AppleScriptTemplates.escape_string(title)
-        escaped_project_id = AppleScriptTemplates.escape_string(project_id)
-
-        script = f'''
-            tell application "Things3"
-                try
-                    set targetProject to project id {escaped_project_id}
-                    set newHeading to make new heading with properties {{name:{escaped_title}}} at end of targetProject
-                    return id of newHeading
-                on error errMsg
-                    return "error: " & errMsg
-                end try
-            end tell
-            '''
-
-        return script
-
     async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
-        """Add a new heading (section) within a project using AppleScript."""
-        try:
-            project_id = kwargs.get('project_id', '') or kwargs.get('list_id', '')
+        """Add a new heading (section) within a project.
 
-            if not project_id:
-                return {
-                    "success": False,
-                    "error": "project_id (or list_id) is required to create a heading",
-                    "message": "Failed to create heading"
-                }
+        Uses the Things URL scheme `json` command (a project update operation
+        appending an `items` array). Things 3's AppleScript dictionary has no
+        heading class, so this cannot be done via AppleScript.
 
-            script = self._build_create_heading_script(title, project_id)
-            result = await self.applescript.execute_applescript(script)
+        Requires the Things URL-scheme auth token (see HeadingOperations).
+        """
+        project_id = kwargs.get('project_id', '') or kwargs.get('list_id', '')
 
-            if result.get("success"):
-                heading_id = result.get("output", "").strip()
-                if heading_id and not heading_id.startswith("error:"):
-                    return {
-                        "success": True,
-                        "heading_id": heading_id,
-                        "message": "Heading created successfully"
-                    }
-                return {
-                    "success": False,
-                    "error": heading_id,
-                    "message": "Failed to create heading"
-                }
+        if not project_id:
             return {
                 "success": False,
-                "error": result.get("output", "AppleScript execution failed"),
+                "error": "project_id (or list_id) is required to create a heading",
                 "message": "Failed to create heading"
             }
 
-        except Exception as e:
-            logger.error(f"Error adding heading: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": "Failed to add heading"
-            }
+        return await self.heading_ops.create_heading(title, project_id)
 
     async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
-        """Update an existing heading (section) using AppleScript.
+        """Rename a heading (section).
 
         Things 3 headings only support a title - there are no notes, tags, or
-        deadlines on headings.
+        deadlines on headings. Performed via the URL scheme `update` command
+        with database verification (AppleScript cannot touch headings).
         """
-        try:
-            title = kwargs.get('title', '')
+        title = kwargs.get('title', '')
 
-            if not title:
-                return {
-                    "success": False,
-                    "error": "title is required",
-                    "message": "Failed to update heading: no fields to update"
-                }
-
-            escaped_title = AppleScriptTemplates.escape_string(title)
-
-            script = f'''
-            tell application "Things3"
-                try
-                    set targetHeading to heading id "{heading_id}"
-                    set name of targetHeading to {escaped_title}
-                    return "updated"
-                on error errMsg
-                    return "error: " & errMsg
-                end try
-            end tell
-            '''
-
-            result = await self.applescript.execute_applescript(script)
-
-            if result.get("success"):
-                output = result.get("output", "").strip()
-                if output == "updated":
-                    return {
-                        "success": True,
-                        "message": "Heading updated successfully"
-                    }
-                return {
-                    "success": False,
-                    "error": output,
-                    "message": "Failed to update heading"
-                }
+        if not title:
             return {
                 "success": False,
-                "error": result.get("output", "AppleScript execution failed"),
-                "message": "Failed to update heading"
+                "error": "title is required",
+                "message": "Failed to update heading: no fields to update"
             }
 
-        except Exception as e:
-            logger.error(f"Error updating heading: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": "Failed to update heading"
-            }
+        return await self.heading_ops.rename_heading(heading_id, title)
 
     async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
-        """Delete a heading (section) using AppleScript."""
-        try:
-            script = f'''
-            tell application "Things3"
-                try
-                    set targetHeading to heading id "{heading_id}"
-                    delete targetHeading
-                    return "deleted"
-                on error errMsg
-                    return "error: " & errMsg
-                end try
-            end tell
-            '''
-            result = await self.applescript.execute_applescript(script)
+        """Deleting a heading is not supported by any public Things API.
 
-            if result.get("success"):
-                output = result.get("output", "").strip()
-                if output == "deleted":
-                    return {
-                        "success": True,
-                        "message": "Heading deleted successfully"
-                    }
-                return {
-                    "success": False,
-                    "error": output,
-                    "message": "Failed to delete heading"
-                }
-            return {
-                "success": False,
-                "error": result.get("output", "AppleScript execution failed"),
-                "message": "Failed to delete heading"
-            }
-
-        except Exception as e:
-            logger.error(f"Error deleting heading: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": "Failed to delete heading"
-            }
+        Neither AppleScript (no heading class) nor the URL scheme provide a
+        way to delete headings. Returns a clear error with guidance instead
+        of a cryptic AppleScript failure.
+        """
+        return await self.heading_ops.delete_heading(heading_id)

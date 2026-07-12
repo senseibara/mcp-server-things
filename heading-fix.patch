@@ -1,0 +1,1475 @@
+From 5d6ce0e37e19f957e14b798185dabe37629ab355 Mon Sep 17 00:00:00 2001
+From: fix <fix@local>
+Date: Sun, 12 Jul 2026 07:24:58 +0000
+Subject: [PATCH] Fix heading (section) operations: route through Things URL
+ scheme
+
+Things 3's AppleScript dictionary has no heading class, so every heading
+write (create/rename/assign/move) failed to compile. Move all heading
+writes to the URL scheme with database verification.
+---
+ src/things_mcp/move_operations.py             |  45 +-
+ .../scheduling/heading_operations.py          | 349 +++++++++++++++
+ src/things_mcp/scheduling/todo_operations.py  | 286 ++++--------
+ src/things_mcp/server.py                      |  20 +-
+ .../tools_helpers/write_operations.py         |   6 +-
+ tests/unit/test_heading_management.py         | 417 +++++++++++-------
+ 6 files changed, 741 insertions(+), 382 deletions(-)
+ create mode 100644 src/things_mcp/scheduling/heading_operations.py
+
+diff --git a/src/things_mcp/move_operations.py b/src/things_mcp/move_operations.py
+index 8214841..a4f63bb 100644
+--- a/src/things_mcp/move_operations.py
++++ b/src/things_mcp/move_operations.py
+@@ -12,6 +12,7 @@ import logging
+ 
+ from .services.applescript_manager import AppleScriptManager
+ from .services.validation_service import ValidationService
++from .scheduling.heading_operations import HeadingOperations
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -26,6 +27,9 @@ class MoveOperationsTools:
+     ):
+         self.applescript = applescript_manager
+         self.validator = validation_service
++        # Heading moves must use the URL scheme; Things 3's AppleScript
++        # dictionary has no heading class.
++        self.heading_ops = HeadingOperations(applescript_manager)
+     
+     async def move_record(
+         self,
+@@ -399,9 +403,20 @@ class MoveOperationsTools:
+                 area_id = destination[5:]  # Remove "area:" prefix
+                 script = await self._build_area_move_script(todo_id, area_id)
+             elif destination.startswith("heading:"):
+-                # Moving to a heading (section) within a project
++                # Moving to a heading (section) within a project.
++                # AppleScript cannot do this (no heading class in Things 3's
++                # dictionary) - delegate to the URL scheme with verification.
+                 heading_id = destination[8:]  # Remove "heading:" prefix
+-                script = await self._build_heading_move_script(todo_id, heading_id)
++                heading_result = await self.heading_ops.assign_todo_to_heading(
++                    todo_id, heading_id=heading_id
++                )
++                if heading_result.get("success"):
++                    return {"success": True}
++                return {
++                    "success": False,
++                    "error": heading_result.get("error", "HEADING_MOVE_FAILED"),
++                    "message": heading_result.get("message", "Failed to move todo to heading")
++                }
+             else:
+                 return {
+                     "success": False,
+@@ -520,29 +535,3 @@ class MoveOperationsTools:
+ 
+         return script
+ 
+-    async def _build_heading_move_script(
+-        self,
+-        todo_id: str,
+-        heading_id: str
+-    ) -> str:
+-        """Build AppleScript for moving to a heading (section) within a project.
+-
+-        A heading already belongs to a specific project, so setting a todo's
+-        heading also places it in that project.
+-        """
+-        script = f'''
+-        tell application "Things3"
+-            try
+-                set theTodo to to do id "{todo_id}"
+-                set targetHeading to heading id "{heading_id}"
+-
+-                set heading of theTodo to targetHeading
+-
+-                return "MOVED to heading {heading_id}"
+-            on error errMsg
+-                return "ERROR: " & errMsg
+-            end try
+-        end tell
+-        '''
+-
+-        return script
+\ No newline at end of file
+diff --git a/src/things_mcp/scheduling/heading_operations.py b/src/things_mcp/scheduling/heading_operations.py
+new file mode 100644
+index 0000000..b3f2f3f
+--- /dev/null
++++ b/src/things_mcp/scheduling/heading_operations.py
+@@ -0,0 +1,349 @@
++"""Heading (section) operations via the Things URL scheme.
++
++Things 3's AppleScript dictionary does NOT expose headings at all — there is
++no `heading` class, so any script containing `heading id ...`,
++`make new heading`, or `set heading of ...` fails to compile with errors like
++"The variable heading is not defined". Cultured Code's documentation is
++explicit that heading manipulation is only available through the URL scheme
++(and Shortcuts), not AppleScript.
++
++This module therefore implements all heading writes via the URL scheme:
++
++- Creating a heading: `things:///json` with a project `update` operation whose
++  attributes contain an `items` array holding the new heading. Requires the
++  Things URL-scheme auth token.
++- Assigning/moving a todo to a heading: `things:///update` with `heading-id`
++  (or `heading` + `list-id`). Requires the auth token.
++- Renaming a heading: attempted via `things:///update?id=<heading-id>&title=…`
++  (headings are tasks internally); verified by reading the database back. If
++  Things ignores the command, a clear "not supported" error is returned.
++- Deleting a heading: not supported by any public Things API. A clear error
++  with guidance is returned instead of a cryptic AppleScript failure.
++
++Because `open -g 'things:///…'` returns before Things has processed the
++command, every write here is verified by polling the Things database through
++things.py until the change is visible (or a timeout is reached).
++"""
++
++import asyncio
++import json
++import logging
++from typing import Any, Dict, List, Optional
++
++import things
++
++logger = logging.getLogger(__name__)
++
++# How long to poll the Things database waiting for a URL-scheme command to
++# take effect. Things usually processes URLs within a few hundred ms.
++_VERIFY_ATTEMPTS = 12
++_VERIFY_DELAY_SECONDS = 0.25
++
++AUTH_TOKEN_HELP = (
++    "A Things URL-scheme auth token is required for heading operations. "
++    "Get it from Things → Settings → General → Enable Things URLs → Manage, "
++    "then save it to a file named '.things-auth' in the project root or your "
++    "home directory."
++)
++
++NOT_SUPPORTED_DELETE = (
++    "Things 3 provides no public API (AppleScript, URL scheme, or JSON "
++    "command) to delete a heading. Delete it in the Things app directly "
++    "(right-click the heading → Delete), or move its todos elsewhere first "
++    "using move_record/update_todo with heading_id."
++)
++
++
++class HeadingOperations:
++    """URL-scheme-backed heading operations with database verification."""
++
++    def __init__(self, applescript_manager):
++        """
++        Args:
++            applescript_manager: AppleScriptManager instance; provides
++                `execute_url_scheme` and the loaded `auth_token`.
++        """
++        self.applescript = applescript_manager
++
++    # ------------------------------------------------------------------
++    # Internal helpers
++    # ------------------------------------------------------------------
++
++    def _require_auth_token(self) -> Optional[Dict[str, Any]]:
++        """Return an error dict if no auth token is configured, else None."""
++        if not getattr(self.applescript, "auth_token", None):
++            return {
++                "success": False,
++                "error": "AUTH_TOKEN_MISSING",
++                "message": AUTH_TOKEN_HELP,
++            }
++        return None
++
++    @staticmethod
++    def _get_project_headings(project_id: str) -> List[Dict[str, Any]]:
++        """Read a project's headings straight from the Things database."""
++        try:
++            return list(things.tasks(type="heading", project=project_id) or [])
++        except Exception as e:  # pragma: no cover - db access issues
++            logger.error(f"Error reading headings for project {project_id}: {e}")
++            return []
++
++    @staticmethod
++    def _get_task(task_id: str) -> Optional[Dict[str, Any]]:
++        """Read a single task/heading from the Things database by ID."""
++        try:
++            return things.get(task_id)
++        except Exception as e:  # pragma: no cover
++            logger.error(f"Error reading task {task_id}: {e}")
++            return None
++
++    async def _poll(self, predicate) -> Optional[Any]:
++        """Poll a synchronous predicate until it returns a truthy value.
++
++        The predicate runs in a thread executor so the database reads don't
++        block the event loop. Returns the predicate's value, or None on
++        timeout.
++        """
++        loop = asyncio.get_event_loop()
++        for _ in range(_VERIFY_ATTEMPTS):
++            await asyncio.sleep(_VERIFY_DELAY_SECONDS)
++            result = await loop.run_in_executor(None, predicate)
++            if result:
++                return result
++        return None
++
++    # ------------------------------------------------------------------
++    # Public operations
++    # ------------------------------------------------------------------
++
++    async def create_heading(self, title: str, project_id: str) -> Dict[str, Any]:
++        """Create a heading inside an existing project.
++
++        Uses the `json` URL command with a project `update` operation that
++        appends an `items` array containing the heading. The new heading's ID
++        is recovered by diffing the project's headings before and after.
++        """
++        auth_error = self._require_auth_token()
++        if auth_error:
++            return auth_error
++
++        loop = asyncio.get_event_loop()
++
++        # Confirm the target project exists and snapshot current heading IDs
++        # so we can identify the newly created one even with duplicate titles.
++        project = await loop.run_in_executor(None, self._get_task, project_id)
++        if not project or project.get("type") != "project":
++            return {
++                "success": False,
++                "error": "PROJECT_NOT_FOUND",
++                "message": (
++                    f"No project with ID '{project_id}' found. Headings can "
++                    "only be created inside projects (not areas)."
++                ),
++            }
++
++        before_ids = {
++            h.get("uuid")
++            for h in await loop.run_in_executor(
++                None, self._get_project_headings, project_id
++            )
++        }
++
++        payload = [
++            {
++                "type": "project",
++                "operation": "update",
++                "id": project_id,
++                "attributes": {
++                    "items": [
++                        {"type": "heading", "attributes": {"title": title}}
++                    ]
++                },
++            }
++        ]
++        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
++
++        result = await self.applescript.execute_url_scheme("json", {"data": data})
++        if not result.get("success"):
++            return {
++                "success": False,
++                "error": result.get("error", "URL scheme execution failed"),
++                "message": "Failed to create heading",
++            }
++
++        def find_new_heading():
++            for h in self._get_project_headings(project_id):
++                if h.get("uuid") not in before_ids and h.get("title") == title:
++                    return h
++            return None
++
++        new_heading = await self._poll(find_new_heading)
++        if new_heading:
++            return {
++                "success": True,
++                "heading_id": new_heading.get("uuid"),
++                "title": title,
++                "project_id": project_id,
++                "message": "Heading created successfully",
++            }
++
++        return {
++            "success": False,
++            "error": "VERIFICATION_FAILED",
++            "message": (
++                "The create-heading command was sent to Things but the new "
++                "heading did not appear in the database. Check that the URL "
++                "scheme is enabled and the auth token is valid "
++                "(Things → Settings → General)."
++            ),
++        }
++
++    async def assign_todo_to_heading(
++        self,
++        todo_id: str,
++        heading_id: str = "",
++        heading: str = "",
++        project_id: str = "",
++    ) -> Dict[str, Any]:
++        """Move an existing todo under a heading via `things:///update`.
++
++        The URL scheme requires the todo to end up in the project containing
++        the heading, so when only `heading_id` is given the enclosing project
++        is looked up from the database and passed as `list-id` in the same
++        call (this also moves the todo into the project if needed).
++        """
++        auth_error = self._require_auth_token()
++        if auth_error:
++            return auth_error
++
++        loop = asyncio.get_event_loop()
++        params: Dict[str, Any] = {"id": todo_id}
++
++        if heading_id:
++            heading_task = await loop.run_in_executor(None, self._get_task, heading_id)
++            if not heading_task or heading_task.get("type") != "heading":
++                return {
++                    "success": False,
++                    "error": "HEADING_NOT_FOUND",
++                    "message": f"No heading with ID '{heading_id}' found.",
++                }
++            enclosing_project = heading_task.get("project") or project_id
++            if enclosing_project:
++                params["list-id"] = enclosing_project
++            params["heading-id"] = heading_id
++            expected = lambda t: t and t.get("heading") == heading_id
++        elif heading:
++            if not project_id:
++                return {
++                    "success": False,
++                    "error": "MISSING_PROJECT",
++                    "message": (
++                        "Assigning by heading title requires the ID of the "
++                        "project containing it (list_id), or use heading_id."
++                    ),
++                }
++            params["list-id"] = project_id
++            params["heading"] = heading
++
++            def expected(t):
++                if not t or not t.get("heading"):
++                    return False
++                h = self._get_task(t["heading"])
++                return bool(h and h.get("title") == heading)
++        else:
++            return {
++                "success": False,
++                "error": "MISSING_HEADING",
++                "message": "Either heading_id or heading must be provided.",
++            }
++
++        result = await self.applescript.execute_url_scheme("update", params)
++        if not result.get("success"):
++            return {
++                "success": False,
++                "error": result.get("error", "URL scheme execution failed"),
++                "message": "Failed to assign todo to heading",
++            }
++
++        verified = await self._poll(lambda: expected(self._get_task(todo_id)))
++        if verified:
++            return {
++                "success": True,
++                "todo_id": todo_id,
++                "message": "Todo assigned to heading successfully",
++            }
++
++        return {
++            "success": False,
++            "error": "VERIFICATION_FAILED",
++            "message": (
++                "The update command was sent to Things but the todo's heading "
++                "did not change. Verify the heading exists in the todo's "
++                "project and that the auth token is valid."
++            ),
++        }
++
++    async def rename_heading(self, heading_id: str, new_title: str) -> Dict[str, Any]:
++        """Rename a heading via `things:///update` with verification.
++
++        Headings are tasks internally; the `update` command accepts their IDs
++        for title changes. The database is read back to confirm — if Things
++        ignored the command, an explicit error is returned.
++        """
++        auth_error = self._require_auth_token()
++        if auth_error:
++            return auth_error
++
++        loop = asyncio.get_event_loop()
++        heading_task = await loop.run_in_executor(None, self._get_task, heading_id)
++        if not heading_task or heading_task.get("type") != "heading":
++            return {
++                "success": False,
++                "error": "HEADING_NOT_FOUND",
++                "message": f"No heading with ID '{heading_id}' found.",
++            }
++        if heading_task.get("title") == new_title:
++            return {
++                "success": True,
++                "heading_id": heading_id,
++                "message": "Heading already has this title",
++            }
++
++        result = await self.applescript.execute_url_scheme(
++            "update", {"id": heading_id, "title": new_title}
++        )
++        if not result.get("success"):
++            return {
++                "success": False,
++                "error": result.get("error", "URL scheme execution failed"),
++                "message": "Failed to rename heading",
++            }
++
++        verified = await self._poll(
++            lambda: (self._get_task(heading_id) or {}).get("title") == new_title
++        )
++        if verified:
++            return {
++                "success": True,
++                "heading_id": heading_id,
++                "title": new_title,
++                "message": "Heading renamed successfully",
++            }
++
++        return {
++            "success": False,
++            "error": "NOT_SUPPORTED_OR_FAILED",
++            "message": (
++                "Things did not apply the title change. Renaming headings via "
++                "the URL scheme may not be supported by your Things version; "
++                "rename it in the Things app directly."
++            ),
++        }
++
++    async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
++        """Deleting headings is not possible via any public Things API."""
++        return {
++            "success": False,
++            "error": "NOT_SUPPORTED",
++            "message": NOT_SUPPORTED_DELETE,
++        }
+diff --git a/src/things_mcp/scheduling/todo_operations.py b/src/things_mcp/scheduling/todo_operations.py
+index 9d422d6..80754f8 100644
+--- a/src/things_mcp/scheduling/todo_operations.py
++++ b/src/things_mcp/scheduling/todo_operations.py
+@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
+ 
+ from ..locale_aware_dates import locale_handler
+ from ..utils.applescript_utils import AppleScriptTemplates
++from .heading_operations import HeadingOperations
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -22,6 +23,9 @@ class TodoOperations:
+         """
+         self.applescript = applescript_manager
+         self.scheduler = scheduler
++        # Heading (section) writes must go through the URL scheme;
++        # Things 3's AppleScript dictionary has no heading class.
++        self.heading_ops = HeadingOperations(applescript_manager)
+ 
+     def _convert_to_boolean(self, value: Any) -> Optional[bool]:
+         """
+@@ -63,10 +67,15 @@ class TodoOperations:
+ 
+     def _build_create_todo_script(self, title: str, notes: str, tags: List[str],
+                                   deadline: str, area: str, project: str,
+-                                  checklist: List[str], heading: str = '',
+-                                  heading_id: str = '') -> str:
++                                  checklist: List[str]) -> str:
+         """Build AppleScript for creating a new todo.
+ 
++        NOTE: Heading (section) assignment is intentionally NOT handled here.
++        Things 3's AppleScript dictionary has no `heading` class, so any
++        script referencing headings fails to compile ("The variable heading
++        is not defined"). Heading assignment happens after creation via the
++        URL scheme (see HeadingOperations.assign_todo_to_heading).
++
+         Args:
+             title: Todo title
+             notes: Todo notes
+@@ -75,10 +84,6 @@ class TodoOperations:
+             area: Area name or ID
+             project: Project ID
+             checklist: Checklist items
+-            heading: Title of an existing heading (section) within `project`
+-                to assign this todo to (requires `project` to also be set)
+-            heading_id: ID of an existing heading to assign this todo to
+-                (takes precedence over `heading`; does not require `project`)
+ 
+         Returns:
+             AppleScript code
+@@ -102,16 +107,6 @@ class TodoOperations:
+         if project:
+             script += f'set project of newTodo to project id "{project}"\n                    '
+ 
+-        # Assign to a specific heading (section) within a project.
+-        # heading_id (direct reference) takes precedence over heading (by title,
+-        # which requires the enclosing project to also be known).
+-        if heading_id:
+-            escaped_heading_id = AppleScriptTemplates.escape_string(heading_id)
+-            script += f'set heading of newTodo to heading id {escaped_heading_id}\n                    '
+-        elif heading and project:
+-            escaped_heading = AppleScriptTemplates.escape_string(heading)
+-            script += f'set heading of newTodo to heading {escaped_heading} of project id "{project}"\n                    '
+-
+         if tags:
+             tags_string = ', '.join(tags)
+             escaped_tags_string = AppleScriptTemplates.escape_string(tags_string)
+@@ -189,8 +184,7 @@ class TodoOperations:
+ 
+             # Otherwise use AppleScript (faster, more reliable for non-checklist todos)
+             script = self._build_create_todo_script(title, notes, tags, deadline,
+-                                                    area, project, checklist,
+-                                                    heading, heading_id)
++                                                    area, project, checklist)
+             result = await self.applescript.execute_applescript(script)
+ 
+             if result.get("success"):
+@@ -202,6 +196,23 @@ class TodoOperations:
+                         "todo_id": todo_id
+                     }
+ 
++                    # Assign to a heading (section) if requested. This must go
++                    # through the URL scheme; AppleScript has no heading class.
++                    if heading_id or heading:
++                        heading_result = await self.heading_ops.assign_todo_to_heading(
++                            todo_id,
++                            heading_id=heading_id,
++                            heading=heading,
++                            project_id=project,
++                        )
++                        if not heading_result.get("success"):
++                            response["warning"] = (
++                                "Todo was created but could not be assigned to "
++                                f"the heading: {heading_result.get('message', heading_result.get('error'))}"
++                            )
++                        else:
++                            response["heading_assignment"] = heading_result.get("message")
++
+                     # Schedule if when date provided
+                     if when:
+                         schedule_result = await self.scheduler.schedule_todo_reliable(todo_id, when)
+@@ -273,7 +284,8 @@ class TodoOperations:
+                 params['deadline'] = kwargs['deadline']
+ 
+             if kwargs.get('list_id'):
+-                params['list'] = kwargs['list_id']
++                # IDs must be passed as 'list-id'; 'list' expects a title.
++                params['list-id'] = kwargs['list_id']
+             elif kwargs.get('list_title'):
+                 params['list'] = kwargs['list_title']
+ 
+@@ -525,11 +537,12 @@ class TodoOperations:
+ 
+     def _build_update_script(self, todo_id: str, title: str, notes: str, tags: List[str],
+                             deadline: str, area: str, project: str,
+-                            completed: Optional[bool], canceled: Optional[bool],
+-                            heading: str = '', heading_id: str = '',
+-                            heading_project_id: str = '') -> str:
++                            completed: Optional[bool], canceled: Optional[bool]) -> str:
+         """Build AppleScript for updating a todo.
+ 
++        Heading (section) changes are handled separately via the URL scheme
++        (Things 3's AppleScript dictionary has no heading class).
++
+         Args:
+             todo_id: Todo ID to update
+             title: New title (or empty)
+@@ -540,13 +553,6 @@ class TodoOperations:
+             project: New project
+             completed: Completion status
+             canceled: Canceled status
+-            heading: Title of an existing heading (section) to move this todo
+-                into (requires `heading_project_id` to also be set)
+-            heading_id: ID of an existing heading to move this todo into
+-                (takes precedence over `heading`; does not require
+-                `heading_project_id`)
+-            heading_project_id: ID of the project that contains `heading`,
+-                required when specifying `heading` by title
+ 
+         Returns:
+             AppleScript code
+@@ -577,16 +583,10 @@ class TodoOperations:
+             escaped_project = AppleScriptTemplates.escape_string(project)
+             script += f'set project of targetTodo to project {escaped_project}\n                    '
+ 
+-        # Move to a specific heading (section) within a project.
+-        # heading_id (direct reference) takes precedence over heading (by
+-        # title, which requires the enclosing project to also be known).
+-        if heading_id:
+-            escaped_heading_id = AppleScriptTemplates.escape_string(heading_id)
+-            script += f'set heading of targetTodo to heading id {escaped_heading_id}\n                    '
+-        elif heading and heading_project_id:
+-            escaped_heading = AppleScriptTemplates.escape_string(heading)
+-            escaped_heading_project_id = AppleScriptTemplates.escape_string(heading_project_id)
+-            script += f'set heading of targetTodo to heading {escaped_heading} of project id {escaped_heading_project_id}\n                    '
++        # NOTE: heading (section) assignment is intentionally NOT handled in
++        # AppleScript — Things 3 has no heading class in its scripting
++        # dictionary. It is applied afterwards via the URL scheme in
++        # update_todo().
+ 
+         # Update tags if provided
+         if tags:
+@@ -670,25 +670,41 @@ class TodoOperations:
+ 
+             # Build and execute script
+             script = self._build_update_script(todo_id, title, notes, tags, deadline,
+-                                              area, project, completed, canceled,
+-                                              heading, heading_id, heading_project_id)
++                                              area, project, completed, canceled)
+             result = await self.applescript.execute_applescript(script)
+ 
+             if result.get("success"):
+                 output = result.get("output", "").strip()
+                 if output == "updated":
+-                    # Schedule if when date provided
+-                    if when:
+-                        schedule_result = await self.scheduler.schedule_todo_reliable(todo_id, when)
+-                        return {
+-                            "success": True,
+-                            "message": "Todo updated and scheduled successfully",
+-                            "scheduling": schedule_result
+-                        }
+-                    return {
++                    response = {
+                         "success": True,
+                         "message": "Todo updated successfully"
+                     }
++
++                    # Move to a heading (section) if requested. This must go
++                    # through the URL scheme; AppleScript has no heading class.
++                    if heading_id or heading:
++                        heading_result = await self.heading_ops.assign_todo_to_heading(
++                            todo_id,
++                            heading_id=heading_id,
++                            heading=heading,
++                            project_id=heading_project_id or project,
++                        )
++                        if not heading_result.get("success"):
++                            response["warning"] = (
++                                "Todo fields were updated but the heading "
++                                f"assignment failed: {heading_result.get('message', heading_result.get('error'))}"
++                            )
++                        else:
++                            response["heading_assignment"] = heading_result.get("message")
++
++                    # Schedule if when date provided
++                    if when:
++                        schedule_result = await self.scheduler.schedule_todo_reliable(todo_id, when)
++                        response["message"] = "Todo updated and scheduled successfully"
++                        response["scheduling"] = schedule_result
++
++                    return response
+                 return {
+                     "success": False,
+                     "error": output,
+@@ -1129,171 +1145,49 @@ class TodoOperations:
+                 "message": "Failed to delete area"
+             }
+ 
+-    def _build_create_heading_script(self, title: str, project_id: str) -> str:
+-        """Build AppleScript for creating a new heading (section) within a project.
+-
+-        Args:
+-            title: Heading name
+-            project_id: ID of the project to create the heading in
+-
+-        Returns:
+-            AppleScript code
+-        """
+-        escaped_title = AppleScriptTemplates.escape_string(title)
+-        escaped_project_id = AppleScriptTemplates.escape_string(project_id)
+-
+-        script = f'''
+-            tell application "Things3"
+-                try
+-                    set targetProject to project id {escaped_project_id}
+-                    set newHeading to make new heading with properties {{name:{escaped_title}}} at end of targetProject
+-                    return id of newHeading
+-                on error errMsg
+-                    return "error: " & errMsg
+-                end try
+-            end tell
+-            '''
+-
+-        return script
+-
+     async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
+-        """Add a new heading (section) within a project using AppleScript."""
+-        try:
+-            project_id = kwargs.get('project_id', '') or kwargs.get('list_id', '')
++        """Add a new heading (section) within a project.
+ 
+-            if not project_id:
+-                return {
+-                    "success": False,
+-                    "error": "project_id (or list_id) is required to create a heading",
+-                    "message": "Failed to create heading"
+-                }
++        Uses the Things URL scheme `json` command (a project update operation
++        appending an `items` array). Things 3's AppleScript dictionary has no
++        heading class, so this cannot be done via AppleScript.
+ 
+-            script = self._build_create_heading_script(title, project_id)
+-            result = await self.applescript.execute_applescript(script)
++        Requires the Things URL-scheme auth token (see HeadingOperations).
++        """
++        project_id = kwargs.get('project_id', '') or kwargs.get('list_id', '')
+ 
+-            if result.get("success"):
+-                heading_id = result.get("output", "").strip()
+-                if heading_id and not heading_id.startswith("error:"):
+-                    return {
+-                        "success": True,
+-                        "heading_id": heading_id,
+-                        "message": "Heading created successfully"
+-                    }
+-                return {
+-                    "success": False,
+-                    "error": heading_id,
+-                    "message": "Failed to create heading"
+-                }
++        if not project_id:
+             return {
+                 "success": False,
+-                "error": result.get("output", "AppleScript execution failed"),
++                "error": "project_id (or list_id) is required to create a heading",
+                 "message": "Failed to create heading"
+             }
+ 
+-        except Exception as e:
+-            logger.error(f"Error adding heading: {e}")
+-            return {
+-                "success": False,
+-                "error": str(e),
+-                "message": "Failed to add heading"
+-            }
++        return await self.heading_ops.create_heading(title, project_id)
+ 
+     async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
+-        """Update an existing heading (section) using AppleScript.
++        """Rename a heading (section).
+ 
+         Things 3 headings only support a title - there are no notes, tags, or
+-        deadlines on headings.
++        deadlines on headings. Performed via the URL scheme `update` command
++        with database verification (AppleScript cannot touch headings).
+         """
+-        try:
+-            title = kwargs.get('title', '')
++        title = kwargs.get('title', '')
+ 
+-            if not title:
+-                return {
+-                    "success": False,
+-                    "error": "title is required",
+-                    "message": "Failed to update heading: no fields to update"
+-                }
+-
+-            escaped_title = AppleScriptTemplates.escape_string(title)
+-
+-            script = f'''
+-            tell application "Things3"
+-                try
+-                    set targetHeading to heading id "{heading_id}"
+-                    set name of targetHeading to {escaped_title}
+-                    return "updated"
+-                on error errMsg
+-                    return "error: " & errMsg
+-                end try
+-            end tell
+-            '''
+-
+-            result = await self.applescript.execute_applescript(script)
+-
+-            if result.get("success"):
+-                output = result.get("output", "").strip()
+-                if output == "updated":
+-                    return {
+-                        "success": True,
+-                        "message": "Heading updated successfully"
+-                    }
+-                return {
+-                    "success": False,
+-                    "error": output,
+-                    "message": "Failed to update heading"
+-                }
++        if not title:
+             return {
+                 "success": False,
+-                "error": result.get("output", "AppleScript execution failed"),
+-                "message": "Failed to update heading"
++                "error": "title is required",
++                "message": "Failed to update heading: no fields to update"
+             }
+ 
+-        except Exception as e:
+-            logger.error(f"Error updating heading: {e}")
+-            return {
+-                "success": False,
+-                "error": str(e),
+-                "message": "Failed to update heading"
+-            }
++        return await self.heading_ops.rename_heading(heading_id, title)
+ 
+     async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
+-        """Delete a heading (section) using AppleScript."""
+-        try:
+-            script = f'''
+-            tell application "Things3"
+-                try
+-                    set targetHeading to heading id "{heading_id}"
+-                    delete targetHeading
+-                    return "deleted"
+-                on error errMsg
+-                    return "error: " & errMsg
+-                end try
+-            end tell
+-            '''
+-            result = await self.applescript.execute_applescript(script)
++        """Deleting a heading is not supported by any public Things API.
+ 
+-            if result.get("success"):
+-                output = result.get("output", "").strip()
+-                if output == "deleted":
+-                    return {
+-                        "success": True,
+-                        "message": "Heading deleted successfully"
+-                    }
+-                return {
+-                    "success": False,
+-                    "error": output,
+-                    "message": "Failed to delete heading"
+-                }
+-            return {
+-                "success": False,
+-                "error": result.get("output", "AppleScript execution failed"),
+-                "message": "Failed to delete heading"
+-            }
+-
+-        except Exception as e:
+-            logger.error(f"Error deleting heading: {e}")
+-            return {
+-                "success": False,
+-                "error": str(e),
+-                "message": "Failed to delete heading"
+-            }
++        Neither AppleScript (no heading class) nor the URL scheme provide a
++        way to delete headings. Returns a clear error with guidance instead
++        of a cryptic AppleScript failure.
++        """
++        return await self.heading_ops.delete_heading(heading_id)
+diff --git a/src/things_mcp/server.py b/src/things_mcp/server.py
+index fd8f653..4a2195c 100644
+--- a/src/things_mcp/server.py
++++ b/src/things_mcp/server.py
+@@ -948,7 +948,12 @@ class ThingsMCPServer:
+             title: str = Field(..., min_length=1, description="Title of the heading (section)"),
+             list_id: str = Field(..., description="ID of the project to create this heading in")
+         ) -> Dict[str, Any]:
+-            """Create a new heading (section) within a project."""
++            """Create a new heading (section) within a project.
++
++            Implemented via the Things URL scheme (AppleScript cannot manage
++            headings). Requires the Things URL-scheme auth token to be saved
++            in a '.things-auth' file (project root or home directory).
++            Returns the new heading's ID on success."""
+             try:
+                 return await self.tools.add_heading(
+                     title=title,
+@@ -963,7 +968,11 @@ class ThingsMCPServer:
+             id: str = Field(..., description="ID of the heading to update"),
+             title: str = Field(..., min_length=1, description="New title for the heading")
+         ) -> Dict[str, Any]:
+-            """Update an existing heading's (section's) title."""
++            """Rename an existing heading (section).
++
++            Implemented via the Things URL scheme with database verification;
++            requires the Things URL-scheme auth token ('.things-auth' file).
++            Title is the only editable field on headings."""
+             try:
+                 return await self.tools.update_heading(
+                     heading_id=id,
+@@ -977,7 +986,12 @@ class ThingsMCPServer:
+         async def delete_heading(
+             id: str = Field(..., description="ID of the heading to delete")
+         ) -> Dict[str, Any]:
+-            """Delete a heading (section) by ID."""
++            """Delete a heading (section) by ID.
++
++            NOT SUPPORTED: Things 3 exposes no public API for deleting
++            headings (neither AppleScript nor the URL scheme). This tool
++            returns guidance; delete the heading in the Things app, or move
++            its todos elsewhere with move_record/update_todo."""
+             try:
+                 return await self.tools.delete_heading(id)
+             except Exception as e:
+diff --git a/src/things_mcp/tools_helpers/write_operations.py b/src/things_mcp/tools_helpers/write_operations.py
+index 109e40f..056f2e3 100644
+--- a/src/things_mcp/tools_helpers/write_operations.py
++++ b/src/things_mcp/tools_helpers/write_operations.py
+@@ -258,7 +258,7 @@ class WriteOperations:
+             }
+ 
+     async def add_heading(self, title: str, **kwargs) -> Dict[str, Any]:
+-        """Add a new heading (section) within a project using AppleScript."""
++        """Add a new heading (section) within a project via the Things URL scheme."""
+         try:
+             return await self.reliable_scheduler.add_heading(title=title, **kwargs)
+         except Exception as e:
+@@ -270,7 +270,7 @@ class WriteOperations:
+             }
+ 
+     async def update_heading(self, heading_id: str, **kwargs) -> Dict[str, Any]:
+-        """Update a heading (section) using AppleScript."""
++        """Rename a heading (section) via the Things URL scheme."""
+         try:
+             heading_id = ParameterValidator.validate_non_empty_string(heading_id, 'heading_id')
+         except ValidationError as e:
+@@ -288,7 +288,7 @@ class WriteOperations:
+             }
+ 
+     async def delete_heading(self, heading_id: str) -> Dict[str, Any]:
+-        """Delete a heading (section) using AppleScript."""
++        """Delete a heading (section) - not supported by Things public APIs."""
+         try:
+             heading_id = ParameterValidator.validate_non_empty_string(heading_id, 'heading_id')
+             return await self.reliable_scheduler.delete_heading(heading_id)
+diff --git a/tests/unit/test_heading_management.py b/tests/unit/test_heading_management.py
+index b97b7fb..838f4b4 100644
+--- a/tests/unit/test_heading_management.py
++++ b/tests/unit/test_heading_management.py
+@@ -1,264 +1,377 @@
+-"""Test heading (section within a project) CRUD operations, and the fix for
+-assigning todos to a heading via add_todo/update_todo.
++"""Test heading (section) CRUD operations and heading assignment on todos.
+ 
+-Mirrors the validation/mocking pattern used in test_area_management.py.
++Heading writes CANNOT use AppleScript: Things 3's scripting dictionary has no
++`heading` class ("The variable heading is not defined" errors). The correct
++channel is the Things URL scheme, so these tests assert that:
++
++- add_heading issues a `json` URL command (project update + items) and
++  recovers the new heading's ID from the database,
++- add_todo/update_todo assign headings via the `update` URL command,
++- move_record with a `heading:` destination uses the URL scheme,
++- update_heading renames via the URL scheme with database verification,
++- delete_heading returns a clear "not supported" error.
++
++Database reads (things.py) and URL execution are mocked; verification polling
++delays are zeroed for test speed.
+ """
+ 
++import json
++
+ import pytest
+-from unittest.mock import AsyncMock, MagicMock
++from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ from things_mcp.tools import ThingsTools
+-from things_mcp.services.applescript_manager import AppleScriptManager
++from things_mcp.scheduling import heading_operations
++
++
++@pytest.fixture(autouse=True)
++def fast_polling(monkeypatch):
++    """Make database verification polling instantaneous in tests."""
++    monkeypatch.setattr(heading_operations, "_VERIFY_DELAY_SECONDS", 0)
++    monkeypatch.setattr(heading_operations, "_VERIFY_ATTEMPTS", 3)
+ 
+ 
+ @pytest.fixture
+ def mock_applescript():
+-    """Create a mock AppleScript manager."""
+-    mock = MagicMock(spec=AppleScriptManager)
++    """Create a mock AppleScript manager with URL-scheme support."""
++    mock = MagicMock()
++    mock.auth_token = "test-auth-token"
+     mock.execute_applescript = AsyncMock(return_value={
+         'success': True,
+-        'output': 'HEADING-ID-123'
++        'output': 'TODO-ID-1'
++    })
++    mock.execute_url_scheme = AsyncMock(return_value={
++        'success': True,
++        'url': 'things:///mock',
++        'message': 'ok'
+     })
+     return mock
+ 
+ 
+ @pytest.fixture
+ def tools(mock_applescript):
+-    """Create ThingsTools with mocked AppleScript."""
++    """Create ThingsTools with mocked AppleScript manager."""
+     return ThingsTools(mock_applescript)
+ 
+ 
++def make_things_mock(*, headings_before=None, headings_after=None, tasks_by_id=None):
++    """Build a mock for the `things` module used by heading_operations.
++
++    Args:
++        headings_before: list returned by the first things.tasks() call
++            (the pre-create snapshot); defaults to empty
++        headings_after: list returned by subsequent things.tasks() calls
++            (post-create verification reads)
++        tasks_by_id: dict mapping task/heading IDs to task dicts for
++            things.get()
++    """
++    things_mock = MagicMock()
++    before = headings_before or []
++    after = headings_after if headings_after is not None else before
++    state = {'calls': 0}
++
++    def tasks_side_effect(*args, **kwargs):
++        state['calls'] += 1
++        return before if state['calls'] == 1 else after
++
++    things_mock.tasks.side_effect = tasks_side_effect
++    lookup = tasks_by_id or {}
++    things_mock.get.side_effect = lambda task_id: lookup.get(task_id)
++    return things_mock
++
++
++PROJECT = {'uuid': 'PROJECT-ID-1', 'type': 'project', 'title': 'My Project'}
++NEW_HEADING = {'uuid': 'HEADING-ID-123', 'type': 'heading',
++               'title': 'Research', 'project': 'PROJECT-ID-1'}
++
++
+ @pytest.mark.asyncio
+ class TestAddHeading:
+-    """Test add_heading."""
++    """add_heading must use the URL scheme json command, never AppleScript."""
+ 
+     async def test_add_heading_succeeds(self, tools, mock_applescript):
+-        result = await tools.add_heading(title="Research", list_id="PROJECT-ID-1")
++        things_mock = make_things_mock(
++            headings_after=[NEW_HEADING],
++            tasks_by_id={'PROJECT-ID-1': PROJECT},
++        )
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_heading(title="Research", list_id="PROJECT-ID-1")
+ 
+         assert result['success'] is True
+         assert result['heading_id'] == 'HEADING-ID-123'
+ 
+-        mock_applescript.execute_applescript.assert_called_once()
+-        script = mock_applescript.execute_applescript.call_args[0][0]
+-        assert 'make new heading' in script
+-        assert 'Research' in script
+-        assert 'PROJECT-ID-1' in script
++        # Must NOT have gone through AppleScript (no heading class exists)
++        mock_applescript.execute_applescript.assert_not_called()
++
++        # Must have used the json URL command with a project update op
++        mock_applescript.execute_url_scheme.assert_called_once()
++        action, params = mock_applescript.execute_url_scheme.call_args[0]
++        assert action == 'json'
++        payload = json.loads(params['data'])
++        assert payload[0]['type'] == 'project'
++        assert payload[0]['operation'] == 'update'
++        assert payload[0]['id'] == 'PROJECT-ID-1'
++        items = payload[0]['attributes']['items']
++        assert items == [{'type': 'heading', 'attributes': {'title': 'Research'}}]
+ 
+     async def test_add_heading_requires_project(self, tools):
+         result = await tools.add_heading(title="Research")
++        assert result['success'] is False
++
++    async def test_add_heading_requires_auth_token(self, tools, mock_applescript):
++        mock_applescript.auth_token = None
++        things_mock = make_things_mock(tasks_by_id={'PROJECT-ID-1': PROJECT})
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_heading(title="Research", list_id="PROJECT-ID-1")
+ 
+         assert result['success'] is False
++        assert 'auth' in result['message'].lower()
++        mock_applescript.execute_url_scheme.assert_not_called()
+ 
+-    async def test_add_heading_handles_applescript_error(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'error: Things got an error'
+-        }
++    async def test_add_heading_rejects_unknown_project(self, tools, mock_applescript):
++        things_mock = make_things_mock(tasks_by_id={})
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_heading(title="Research", list_id="NOPE")
+ 
+-        result = await tools.add_heading(title="Research", list_id="PROJECT-ID-1")
++        assert result['success'] is False
++        assert result['error'] == 'PROJECT_NOT_FOUND'
++
++    async def test_add_heading_reports_verification_failure(self, tools, mock_applescript):
++        # URL fires fine, but the heading never appears in the database
++        things_mock = make_things_mock(
++            headings_after=[],
++            tasks_by_id={'PROJECT-ID-1': PROJECT},
++        )
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_heading(title="Research", list_id="PROJECT-ID-1")
+ 
+         assert result['success'] is False
++        assert result['error'] == 'VERIFICATION_FAILED'
+ 
+ 
+ @pytest.mark.asyncio
+ class TestUpdateHeading:
+-    """Test update_heading."""
++    """Renaming goes through the URL scheme with read-back verification."""
+ 
+     async def test_update_with_none_fails(self, tools):
+         result = await tools.update_heading(None, title="Renamed")
+-
+         assert result['success'] is False
+         assert result.get('field') == 'heading_id'
+ 
+     async def test_update_with_empty_string_fails(self, tools):
+         result = await tools.update_heading('', title="Renamed")
+-
+         assert result['success'] is False
+         assert result.get('field') == 'heading_id'
+ 
+     async def test_update_requires_title(self, tools):
+-        result = await tools.update_heading('ValidHeadingID123')
+-
++        result = await tools.update_heading('HEADING-ID-123')
+         assert result['success'] is False
+ 
+     async def test_update_with_valid_id_succeeds(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'updated'
+-        }
+-
+-        result = await tools.update_heading('ValidHeadingID123', title="Renamed Heading")
++        renamed = dict(NEW_HEADING, title='Renamed Heading')
++        # First read returns the old title, verification reads the new one
++        things_mock = MagicMock()
++        things_mock.get.side_effect = [NEW_HEADING, renamed]
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.update_heading('HEADING-ID-123', title="Renamed Heading")
+ 
+         assert result['success'] is True
++        mock_applescript.execute_applescript.assert_not_called()
++        action, params = mock_applescript.execute_url_scheme.call_args[0]
++        assert action == 'update'
++        assert params == {'id': 'HEADING-ID-123', 'title': 'Renamed Heading'}
+ 
+-        mock_applescript.execute_applescript.assert_called_once()
+-        script = mock_applescript.execute_applescript.call_args[0][0]
+-        assert 'ValidHeadingID123' in script
+-        assert 'Renamed Heading' in script
++    async def test_update_unknown_heading_fails(self, tools, mock_applescript):
++        things_mock = make_things_mock(tasks_by_id={})
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.update_heading('NonexistentID', title="X")
+ 
+-    async def test_update_error_handling(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': False,
+-            'error': 'Can\'t get heading id "NonexistentID"'
+-        }
++        assert result['success'] is False
++        assert result['error'] == 'HEADING_NOT_FOUND'
+ 
+-        result = await tools.update_heading('NonexistentID', title="X")
++    async def test_update_reports_when_things_ignores_command(self, tools, mock_applescript):
++        # Title never changes in the database -> explicit failure, not silence
++        things_mock = make_things_mock(tasks_by_id={'HEADING-ID-123': NEW_HEADING})
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.update_heading('HEADING-ID-123', title="Renamed")
+ 
+         assert result['success'] is False
++        assert 'rename' in result['message'].lower() or 'title' in result['message'].lower()
+ 
+ 
+ @pytest.mark.asyncio
+ class TestDeleteHeading:
+-    """Test delete_heading."""
++    """Deletion is impossible via public APIs; the error must say so."""
+ 
+     async def test_delete_with_none_fails(self, tools):
+         result = await tools.delete_heading(None)
+-
+         assert result['success'] is False
+         assert result.get('field') == 'heading_id'
+ 
+-    async def test_delete_with_empty_string_fails(self, tools):
+-        result = await tools.delete_heading('')
+-
+-        assert result['success'] is False
+-        assert result.get('field') == 'heading_id'
+-
+-    async def test_delete_with_valid_id_succeeds(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'deleted'
+-        }
+-
+-        result = await tools.delete_heading('ValidHeadingID123')
+-
+-        assert result['success'] is True
+-        assert 'successfully' in result['message'].lower()
+-
+-        mock_applescript.execute_applescript.assert_called_once()
+-        script = mock_applescript.execute_applescript.call_args[0][0]
+-        assert 'ValidHeadingID123' in script
+-        assert 'delete' in script.lower()
+-
+-    async def test_delete_error_handling(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': False,
+-            'error': 'Can\'t get heading id "NonexistentID"'
+-        }
+-
+-        result = await tools.delete_heading('NonexistentID')
++    async def test_delete_returns_clear_not_supported_error(self, tools, mock_applescript):
++        result = await tools.delete_heading('HEADING-ID-123')
+ 
+         assert result['success'] is False
++        assert result['error'] == 'NOT_SUPPORTED'
++        # Guidance, not a cryptic AppleScript error
++        assert 'Things app' in result['message']
++        mock_applescript.execute_applescript.assert_not_called()
++        mock_applescript.execute_url_scheme.assert_not_called()
+ 
+ 
+ @pytest.mark.asyncio
+ class TestAddTodoHeadingAssignment:
+-    """Regression tests for the add_todo 'heading' bug: previously the
+-    AppleScript (non-checklist) path silently dropped the heading parameter.
+-    """
+-
+-    async def test_add_todo_with_heading_and_list_id_sets_heading(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'TODO-ID-1'
+-        }
+-
+-        result = await tools.add_todo(
+-            title="Research competitors",
+-            list_id="PROJECT-ID-1",
+-            heading="Research"
+-        )
++    """add_todo creates via AppleScript, then assigns the heading via the
++    URL scheme update command (with list-id resolved from the database)."""
++
++    async def test_add_todo_with_heading_id(self, tools, mock_applescript):
++        todo_in_heading = {'uuid': 'TODO-ID-1', 'type': 'to-do',
++                           'heading': 'HEADING-ID-123'}
++        things_mock = make_things_mock(tasks_by_id={
++            'HEADING-ID-123': NEW_HEADING,
++            'TODO-ID-1': todo_in_heading,
++        })
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_todo(
++                title="Research competitors",
++                heading_id="HEADING-ID-9" if False else "HEADING-ID-123",
++            )
+ 
+         assert result['success'] is True
++        assert result['todo_id'] == 'TODO-ID-1'
++        assert 'warning' not in result
+ 
+-        mock_applescript.execute_applescript.assert_called_once()
++        # Creation script must not mention headings at all
+         script = mock_applescript.execute_applescript.call_args[0][0]
+-        # This is the core regression check: the heading must actually be
+-        # set on the newly created to-do, not silently dropped.
+-        assert 'set heading of newTodo to heading' in script
+-        assert 'Research' in script
+-        assert 'PROJECT-ID-1' in script
+-
+-    async def test_add_todo_with_heading_id_sets_heading_by_id(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'TODO-ID-1'
+-        }
++        assert 'heading' not in script.lower()
+ 
+-        result = await tools.add_todo(
+-            title="Research competitors",
+-            heading_id="HEADING-ID-9"
+-        )
++        # Assignment via URL scheme, including the enclosing project
++        action, params = mock_applescript.execute_url_scheme.call_args[0]
++        assert action == 'update'
++        assert params['id'] == 'TODO-ID-1'
++        assert params['heading-id'] == 'HEADING-ID-123'
++        assert params['list-id'] == 'PROJECT-ID-1'
++
++    async def test_add_todo_with_heading_title_and_project(self, tools, mock_applescript):
++        todo_in_heading = {'uuid': 'TODO-ID-1', 'type': 'to-do',
++                           'heading': 'HEADING-ID-123'}
++        things_mock = make_things_mock(tasks_by_id={
++            'HEADING-ID-123': NEW_HEADING,
++            'TODO-ID-1': todo_in_heading,
++        })
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_todo(
++                title="Research competitors",
++                list_id="PROJECT-ID-1",
++                heading="Research",
++            )
+ 
+         assert result['success'] is True
+-        script = mock_applescript.execute_applescript.call_args[0][0]
+-        assert 'set heading of newTodo to heading id' in script
+-        assert 'HEADING-ID-9' in script
++        action, params = mock_applescript.execute_url_scheme.call_args[0]
++        assert action == 'update'
++        assert params['heading'] == 'Research'
++        assert params['list-id'] == 'PROJECT-ID-1'
+ 
+     async def test_add_todo_with_heading_but_no_project_fails_clearly(self, tools):
+-        result = await tools.add_todo(
+-            title="Research competitors",
+-            heading="Research"
+-        )
+-
++        result = await tools.add_todo(title="Research competitors", heading="Research")
+         assert result['success'] is False
+         assert 'heading' in result['error'].lower()
+ 
+-    async def test_add_todo_without_heading_does_not_reference_heading(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'TODO-ID-1'
+-        }
+-
++    async def test_add_todo_without_heading_makes_no_url_call(self, tools, mock_applescript):
+         result = await tools.add_todo(title="Plain todo", list_id="PROJECT-ID-1")
+ 
+         assert result['success'] is True
+         script = mock_applescript.execute_applescript.call_args[0][0]
+         assert 'heading' not in script.lower()
++        mock_applescript.execute_url_scheme.assert_not_called()
++
++    async def test_add_todo_reports_failed_assignment_as_warning(self, tools, mock_applescript):
++        # Heading exists but the todo never lands under it
++        things_mock = make_things_mock(tasks_by_id={
++            'HEADING-ID-123': NEW_HEADING,
++            'TODO-ID-1': {'uuid': 'TODO-ID-1', 'type': 'to-do', 'heading': None},
++        })
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.add_todo(
++                title="Research competitors",
++                heading_id="HEADING-ID-123",
++            )
++
++        # Todo creation itself succeeded, but the caller must be told the
++        # heading assignment did not stick.
++        assert result['success'] is True
++        assert 'warning' in result
++        assert 'heading' in result['warning'].lower()
+ 
+ 
+ @pytest.mark.asyncio
+ class TestUpdateTodoHeadingAssignment:
+-    """Tests for moving an existing todo into a heading via update_todo."""
++    """update_todo moves todos under headings via the URL scheme."""
+ 
+-    async def test_update_todo_with_heading_and_list_id_sets_heading(self, tools, mock_applescript):
++    async def test_update_todo_with_heading_id(self, tools, mock_applescript):
+         mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'updated'
++            'success': True, 'output': 'updated'
+         }
+-
+-        result = await tools.update_todo(
+-            todo_id="TODO-ID-1",
+-            list_id="PROJECT-ID-1",
+-            heading="Research"
+-        )
++        todo_in_heading = {'uuid': 'TODO-ID-1', 'type': 'to-do',
++                           'heading': 'HEADING-ID-123'}
++        things_mock = make_things_mock(tasks_by_id={
++            'HEADING-ID-123': NEW_HEADING,
++            'TODO-ID-1': todo_in_heading,
++        })
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await tools.update_todo(
++                todo_id='TODO-ID-1',
++                heading_id='HEADING-ID-123',
++            )
+ 
+         assert result['success'] is True
+-        script = mock_applescript.execute_applescript.call_args[0][0]
+-        assert 'set heading of targetTodo to heading' in script
+-        assert 'Research' in script
+-        assert 'PROJECT-ID-1' in script
++        assert 'warning' not in result
++        action, params = mock_applescript.execute_url_scheme.call_args[0]
++        assert action == 'update'
++        assert params['id'] == 'TODO-ID-1'
++        assert params['heading-id'] == 'HEADING-ID-123'
++
++    async def test_update_todo_heading_title_requires_project(self, tools):
++        result = await tools.update_todo(todo_id='TODO-ID-1', heading='Research')
++        assert result['success'] is False
++        assert 'heading' in result['error'].lower()
+ 
+-    async def test_update_todo_with_heading_id_sets_heading_by_id(self, tools, mock_applescript):
+-        mock_applescript.execute_applescript.return_value = {
+-            'success': True,
+-            'output': 'updated'
+-        }
+ 
+-        result = await tools.update_todo(
+-            todo_id="TODO-ID-1",
+-            heading_id="HEADING-ID-9"
+-        )
++@pytest.mark.asyncio
++class TestMoveRecordToHeading:
++    """move_record with a heading: destination uses the URL scheme."""
++
++    async def test_move_to_heading_uses_url_scheme(self, mock_applescript):
++        from things_mcp.move_operations import MoveOperationsTools
++
++        move_tools = MoveOperationsTools(mock_applescript, MagicMock())
++        todo_in_heading = {'uuid': 'TODO-ID-1', 'type': 'to-do',
++                           'heading': 'HEADING-ID-123'}
++        things_mock = make_things_mock(tasks_by_id={
++            'HEADING-ID-123': NEW_HEADING,
++            'TODO-ID-1': todo_in_heading,
++        })
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await move_tools._execute_move(
++                'TODO-ID-1', 'heading:HEADING-ID-123', {'title': 'Todo'}
++            )
+ 
+         assert result['success'] is True
+-        script = mock_applescript.execute_applescript.call_args[0][0]
+-        assert 'set heading of targetTodo to heading id' in script
+-        assert 'HEADING-ID-9' in script
+-
+-    async def test_update_todo_with_heading_but_no_list_id_fails_clearly(self, tools):
+-        result = await tools.update_todo(
+-            todo_id="TODO-ID-1",
+-            heading="Research"
+-        )
++        mock_applescript.execute_applescript.assert_not_called()
++        action, params = mock_applescript.execute_url_scheme.call_args[0]
++        assert action == 'update'
++        assert params['heading-id'] == 'HEADING-ID-123'
++        assert params['list-id'] == 'PROJECT-ID-1'
++
++    async def test_move_to_unknown_heading_fails_clearly(self, mock_applescript):
++        from things_mcp.move_operations import MoveOperationsTools
++
++        move_tools = MoveOperationsTools(mock_applescript, MagicMock())
++        things_mock = make_things_mock(tasks_by_id={})
++        with patch.object(heading_operations, 'things', things_mock):
++            result = await move_tools._execute_move(
++                'TODO-ID-1', 'heading:NOPE', {'title': 'Todo'}
++            )
+ 
+         assert result['success'] is False
+-        assert 'heading' in result['error'].lower()
++        assert result['error'] == 'HEADING_NOT_FOUND'
+-- 
+2.43.0
+

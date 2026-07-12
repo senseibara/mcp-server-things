@@ -948,7 +948,12 @@ class ThingsMCPServer:
             title: str = Field(..., min_length=1, description="Title of the heading (section)"),
             list_id: str = Field(..., description="ID of the project to create this heading in")
         ) -> Dict[str, Any]:
-            """Create a new heading (section) within a project."""
+            """Create a new heading (section) within a project.
+
+            Implemented via the Things URL scheme (AppleScript cannot manage
+            headings). Requires the Things URL-scheme auth token to be saved
+            in a '.things-auth' file (project root or home directory).
+            Returns the new heading's ID on success."""
             try:
                 return await self.tools.add_heading(
                     title=title,
@@ -963,7 +968,11 @@ class ThingsMCPServer:
             id: str = Field(..., description="ID of the heading to update"),
             title: str = Field(..., min_length=1, description="New title for the heading")
         ) -> Dict[str, Any]:
-            """Update an existing heading's (section's) title."""
+            """Rename an existing heading (section).
+
+            Implemented via the Things URL scheme with database verification;
+            requires the Things URL-scheme auth token ('.things-auth' file).
+            Title is the only editable field on headings."""
             try:
                 return await self.tools.update_heading(
                     heading_id=id,
@@ -977,7 +986,12 @@ class ThingsMCPServer:
         async def delete_heading(
             id: str = Field(..., description="ID of the heading to delete")
         ) -> Dict[str, Any]:
-            """Delete a heading (section) by ID."""
+            """Delete a heading (section) by ID.
+
+            NOT SUPPORTED: Things 3 exposes no public API for deleting
+            headings (neither AppleScript nor the URL scheme). This tool
+            returns guidance; delete the heading in the Things app, or move
+            its todos elsewhere with move_record/update_todo."""
             try:
                 return await self.tools.delete_heading(id)
             except Exception as e:
